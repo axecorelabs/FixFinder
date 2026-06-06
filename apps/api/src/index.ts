@@ -106,7 +106,7 @@ async function createJobIntake(input: {
   await prisma.aIInference.create({
     data: {
       jobId: job.id,
-      modelName: process.env.OPENROUTER_MODEL ?? "google/gemini-2.0-flash-001",
+      modelName: process.env.OPENROUTER_MODEL ?? "google/gemini-2.5-flash",
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       parsedJson: JSON.parse(JSON.stringify(ai)),
       confidence: ai.confidence

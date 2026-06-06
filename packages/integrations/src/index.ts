@@ -3,7 +3,7 @@ import type { AIInferenceResult } from "@fixfinder/core";
 
 const aiEnvSchema = z.object({
   OPENROUTER_API_KEY: z.string().min(1),
-  OPENROUTER_MODEL: z.string().min(1).default("google/gemini-2.0-flash-001")
+  OPENROUTER_MODEL: z.string().min(1).default("google/gemini-2.0-flash")
 });
 
 export function getAIEnv() {
