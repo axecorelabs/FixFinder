@@ -1,0 +1,44 @@
+{
+  "name": "fixfinder",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm-run-all --parallel dev:*",
+    "dev:admin": "npm run dev -w @fixfinder/admin",
+    "dev:api": "npm run dev -w @fixfinder/api",
+    "dev:bot-customer": "npm run dev -w @fixfinder/bot-customer",
+    "dev:bot-artisan": "npm run dev -w @fixfinder/bot-artisan",
+    "dev:web": "npm run dev -w @fixfinder/web",
+    "build": "npm-run-all build:*",
+    "build:admin": "npm run build -w @fixfinder/admin",
+    "build:api": "npm run build -w @fixfinder/api",
+    "build:bot-customer": "npm run build -w @fixfinder/bot-customer",
+    "build:bot-artisan": "npm run build -w @fixfinder/bot-artisan",
+    "build:web": "npm run build -w @fixfinder/web",
+    "lint": "npm-run-all lint:*",
+    "lint:admin": "npm run lint -w @fixfinder/admin",
+    "lint:api": "npm run lint -w @fixfinder/api",
+    "lint:bot-customer": "npm run lint -w @fixfinder/bot-customer",
+    "lint:bot-artisan": "npm run lint -w @fixfinder/bot-artisan",
+    "lint:web": "npm run lint -w @fixfinder/web",
+    "typecheck": "npm-run-all typecheck:*",
+    "typecheck:admin": "npm run typecheck -w @fixfinder/admin",
+    "typecheck:api": "npm run typecheck -w @fixfinder/api",
+    "typecheck:bot-customer": "npm run typecheck -w @fixfinder/bot-customer",
+    "typecheck:bot-artisan": "npm run typecheck -w @fixfinder/bot-artisan",
+    "typecheck:web": "npm run typecheck -w @fixfinder/web"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "dotenv": "^16.4.1",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

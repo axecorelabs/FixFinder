@@ -1,0 +1,69 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url       = env("SUPABASE_DATABASE_URL")
+  directUrl = env("SUPABASE_DIRECT_URL")
+}
+
+model Job {
+  id                 String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerTelegramId String      @map("customer_telegram_id")
+  customerName       String      @map("customer_name")
+  customerPhone      String      @map("customer_phone")
+  locationText       String      @map("location_text")
+  issueText          String      @map("issue_text")
+  aiCategory         String      @map("ai_category")
+  aiSummary          String?     @map("ai_summary")
+  aiConfidence       Decimal     @default(0) @map("ai_confidence") @db.Decimal(3, 2)
+  status             String
+  createdAt          DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  aiInferences       AIInference[]
+  jobOffers          JobOffer[]
+
+  @@map("jobs")
+}
+
+model AIInference {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  jobId      String   @map("job_id") @db.Uuid
+  modelName  String   @map("model_name")
+  parsedJson Json     @map("parsed_json")
+  confidence Decimal  @db.Decimal(3, 2)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  job        Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@map("ai_inferences")
+}
+
+model Artisan {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  telegramId     String    @unique @map("telegram_id")
+  name           String
+  phone          String
+  skillType      String    @map("skill_type")
+  serviceArea    String    @map("service_area")
+  ratingAvg      Decimal   @default(4) @map("rating_avg") @db.Decimal(3, 2)
+  acceptanceRate Decimal   @default(0.8) @map("acceptance_rate") @db.Decimal(3, 2)
+  availableNow   Boolean   @default(true) @map("available_now")
+  activeStatus   Boolean   @default(true) @map("active_status")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  jobOffers      JobOffer[]
+
+  @@map("artisans")
+}
+
+model JobOffer {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  jobId      String    @map("job_id") @db.Uuid
+  artisanId  String    @map("artisan_id") @db.Uuid
+  offerStatus String   @default("pending") @map("offer_status")
+  offeredAt  DateTime  @default(now()) @map("offered_at") @db.Timestamptz(6)
+  respondedAt DateTime? @map("responded_at") @db.Timestamptz(6)
+  job        Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  artisan    Artisan   @relation(fields: [artisanId], references: [id], onDelete: Cascade)
+
+  @@map("job_offers")
+}
