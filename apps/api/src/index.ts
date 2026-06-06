@@ -39,6 +39,7 @@ type ArtisanRow = {
   id: string;
   telegramId: string;
   skillType: string;
+  postalCode: string;
   ratingAvg: number;
   acceptanceRate: number;
   availableNow: boolean;
@@ -71,6 +72,7 @@ async function createJobIntake(input: {
   customerName: string;
   customerPhone: string;
   locationText: string;
+  customerPostalCode?: string;
   issueText: string;
   mediaUrls: string[];
 }) {
@@ -82,6 +84,7 @@ async function createJobIntake(input: {
       customerName: input.customerName,
       customerPhone: input.customerPhone,
       locationText: input.locationText,
+      ...(input.customerPostalCode ? { customerPostalCode: input.customerPostalCode } : {}),
       issueText: input.issueText,
       aiCategory: ai.category,
       aiSummary: ai.summary,
@@ -118,6 +121,7 @@ async function matchAndDispatch(jobId: string): Promise<{
       customerName: true,
       customerPhone: true,
       locationText: true,
+      customerPostalCode: true,
       issueText: true,
       aiCategory: true,
       aiSummary: true
@@ -132,6 +136,7 @@ async function matchAndDispatch(jobId: string): Promise<{
       id: true,
       telegramId: true,
       skillType: true,
+      postalCode: true,
       ratingAvg: true,
       acceptanceRate: true,
       availableNow: true
@@ -144,7 +149,9 @@ async function matchAndDispatch(jobId: string): Promise<{
   const candidates = artisans.map((a) => ({
     artisanId: a.id,
     skillMatch: 1,
-    distanceScore: 0.75,
+    distanceScore: job.customerPostalCode
+      ? a.postalCode === job.customerPostalCode ? 1.0 : 0.3
+      : 0.75,
     availabilityScore: a.availableNow ? 1 : 0,
     acceptanceRateScore: Number(a.acceptanceRate),
     ratingScore: Math.min(Number(a.ratingAvg) / 5, 1)
@@ -173,7 +180,7 @@ async function matchAndDispatch(jobId: string): Promise<{
       `*Issue:* ${job.aiSummary || job.issueText}`,
       `*Customer:* ${job.customerName}`,
       `*Phone:* ${job.customerPhone}`,
-      `*Location:* ${job.locationText}`,
+      `*Location:* ${job.locationText}${job.customerPostalCode ? ` (${job.customerPostalCode})` : ""}`,
       ``,
       `Reply to accept or decline this job.`
     ].join("\n"),
@@ -255,6 +262,7 @@ async function respondToOffer(
 
 type IntakeState = {
   issueText?: string;
+  postalCode?: string;
   mediaUrls: string[];
   awaitingClarification?: boolean;
 };
@@ -307,8 +315,15 @@ customerBot.on("text", async (ctx) => {
   if (!state.issueText) {
     state.issueText = text;
     intakeByUser.set(ctx.from.id, state);
+    await ctx.reply("What is your postal code? (e.g. 100001)");
+    return;
+  }
+
+  if (!state.postalCode) {
+    state.postalCode = text;
+    intakeByUser.set(ctx.from.id, state);
     await ctx.reply(
-      "Please share your phone contact so we can confirm the artisan assignment.",
+      "Thanks. Please share your phone contact so we can confirm the artisan assignment.",
       Markup.keyboard([[Markup.button.contactRequest("Share contact")]]).oneTime().resize()
     );
     return;
@@ -334,6 +349,7 @@ customerBot.on("contact", async (ctx) => {
         [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || "Unknown",
       customerPhone: ctx.message.contact.phone_number,
       locationText: "Location to be collected — next iteration",
+      ...(state.postalCode ? { customerPostalCode: state.postalCode } : {}),
       issueText: state.issueText,
       mediaUrls: state.mediaUrls
     });
@@ -373,10 +389,11 @@ customerBot.on("contact", async (ctx) => {
 // ── Artisan bot ───────────────────────────────────────────────────────────────
 
 type RegistrationState = {
-  step: "name" | "phone" | "skill" | "area";
+  step: "name" | "phone" | "skill" | "area" | "postal";
   name?: string;
   phone?: string;
   skillType?: string;
+  serviceArea?: string;
 };
 
 const SKILL_CHOICES = ["hvac", "plumbing", "electrical", "general"];
@@ -456,6 +473,14 @@ artisanBot.on("text", async (ctx) => {
   }
 
   if (state.step === "area") {
+    state.serviceArea = text;
+    state.step = "postal";
+    registrationByUser.set(ctx.from.id, state);
+    await ctx.reply("What is your postal code? (e.g. 100001)");
+    return;
+  }
+
+  if (state.step === "postal") {
     registrationByUser.delete(ctx.from.id);
     try {
       await prisma.artisan.create({
@@ -464,14 +489,16 @@ artisanBot.on("text", async (ctx) => {
           name: state.name!,
           phone: state.phone!,
           skillType: state.skillType!,
-          serviceArea: text,
+          serviceArea: state.serviceArea!,
+          postalCode: text,
           ratingAvg: 4,
           acceptanceRate: 0.8,
           availableNow: true,
           activeStatus: true
         }
       });
-    } catch {
+    } catch (err) {
+      app.log.error({ err }, "Artisan registration DB error");
       await ctx.reply(
         "Registration failed. You may already be registered. Try /register again."
       );
@@ -484,7 +511,8 @@ artisanBot.on("text", async (ctx) => {
         ``,
         `*Name:* ${state.name}`,
         `*Skill:* ${state.skillType?.toUpperCase()}`,
-        `*Service area:* ${text}`,
+        `*Service area:* ${state.serviceArea}`,
+        `*Postal code:* ${text}`,
         ``,
         `You will receive job offers here. Accept or decline using the buttons provided.`
       ].join("\n"),
@@ -573,6 +601,7 @@ const artisanRegistrationSchema = z.object({
   phone: z.string().min(6),
   skillType: z.enum(["hvac", "plumbing", "electrical", "general"]),
   serviceArea: z.string().min(2),
+  postalCode: z.string().min(1),
   ratingAvg: z.number().min(0).max(5).default(4),
   acceptanceRate: z.number().min(0).max(1).default(0.8),
   availableNow: z.boolean().default(true)
@@ -618,6 +647,7 @@ app.post("/artisans/register", async (request, reply) => {
         phone: input.phone,
         skillType: input.skillType,
         serviceArea: input.serviceArea,
+        postalCode: input.postalCode,
         ratingAvg: input.ratingAvg,
         acceptanceRate: input.acceptanceRate,
         availableNow: input.availableNow,

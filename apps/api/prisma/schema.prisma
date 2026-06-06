@@ -14,6 +14,7 @@ model Job {
   customerName       String      @map("customer_name")
   customerPhone      String      @map("customer_phone")
   locationText       String      @map("location_text")
+  customerPostalCode String?     @map("customer_postal_code")
   issueText          String      @map("issue_text")
   aiCategory         String      @map("ai_category")
   aiSummary          String?     @map("ai_summary")
@@ -45,6 +46,7 @@ model Artisan {
   phone          String
   skillType      String    @map("skill_type")
   serviceArea    String    @map("service_area")
+  postalCode     String    @map("postal_code")
   ratingAvg      Decimal   @default(4) @map("rating_avg") @db.Decimal(3, 2)
   acceptanceRate Decimal   @default(0.8) @map("acceptance_rate") @db.Decimal(3, 2)
   availableNow   Boolean   @default(true) @map("available_now")

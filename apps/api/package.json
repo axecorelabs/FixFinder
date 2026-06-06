@@ -7,7 +7,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "dev": "npm run build:packages && tsx watch src/index.ts",
-    "build": "npm run build:packages && tsc -p tsconfig.json",
+    "build": "npm run build:packages && prisma generate --schema prisma/schema.prisma && tsc -p tsconfig.json",
     "build:packages": "npm run build -w @fixfinder/core && npm run build -w @fixfinder/integrations",
     "start": "node dist/index.js",
     "prisma:generate": "prisma generate --schema prisma/schema.prisma",
