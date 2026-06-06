@@ -10,13 +10,21 @@ export function getAIEnv() {
   return aiEnvSchema.parse(process.env);
 }
 
+const VALID_CATEGORIES = ["hvac", "plumbing", "electrical", "general"] as const;
+
 const inferenceSchema = z.object({
-  category: z.enum(["hvac", "plumbing", "electrical", "general"]),
-  urgency: z.enum(["low", "medium", "high"]),
-  requiredSkill: z.enum(["hvac", "plumbing", "electrical", "general"]),
+  // Fields we act on — strictly validated.
+  category: z.enum(VALID_CATEGORIES),
+  confidence: z.number().min(0).max(1),
   summary: z.string(),
-  missingInformation: z.array(z.string()),
-  confidence: z.number().min(0).max(1)
+
+  // Fields we store but don't dispatch on — lenient so model variation doesn't crash intake.
+  urgency: z.enum(["low", "medium", "high"]).catch("medium"),
+  requiredSkill: z.enum(VALID_CATEGORIES).catch("general"),
+  missingInformation: z
+    .union([z.array(z.string()), z.string()])
+    .transform((v) => (Array.isArray(v) ? v : v ? [v] : []))
+    .catch([])
 });
 
 interface InferInput {
@@ -24,16 +32,24 @@ interface InferInput {
   imageUrls?: string[];
 }
 
+const SYSTEM_PROMPT = `You are a home repair triage assistant.
+Respond ONLY with a valid JSON object — no markdown, no explanation.
+The JSON must have exactly these keys:
+- category: one of "hvac", "plumbing", "electrical", "general"
+- urgency: one of "low", "medium", "high"
+- requiredSkill: one of "hvac", "plumbing", "electrical", "general"
+- summary: a one-sentence plain-English summary of the issue
+- missingInformation: a JSON array of strings listing any missing details (empty array if none)
+- confidence: a number between 0 and 1 indicating how confident you are in the category`;
+
 export async function inferIssue(input: InferInput): Promise<AIInferenceResult> {
   const env = getAIEnv();
 
-  const prompt = [
-    "You are an assistant for home repair triage.",
-    "Return strict JSON with keys:",
-    "category, urgency, requiredSkill, summary, missingInformation, confidence.",
-    "Categories must be one of hvac/plumbing/electrical/general.",
-    `User issue: ${input.userText}`,
-    input.imageUrls?.length ? `Image URLs: ${input.imageUrls.join(", ")}` : "No images provided."
+  const userContent = [
+    `Issue: ${input.userText}`,
+    input.imageUrls?.length
+      ? `Photos attached: ${input.imageUrls.join(", ")}`
+      : "No photos provided."
   ].join("\n");
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -47,20 +63,15 @@ export async function inferIssue(input: InferInput): Promise<AIInferenceResult> 
       temperature: 0.1,
       response_format: { type: "json_object" },
       messages: [
-        {
-          role: "system",
-          content: "You are precise, safety-aware, and output only JSON."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userContent }
       ]
     })
   });
 
   if (!response.ok) {
-    throw new Error(`OpenRouter call failed: ${response.status} ${response.statusText}`);
+    const body = await response.text().catch(() => "");
+    throw new Error(`OpenRouter call failed: ${response.status} ${response.statusText} ${body}`);
   }
 
   const data = (await response.json()) as {
@@ -72,6 +83,6 @@ export async function inferIssue(input: InferInput): Promise<AIInferenceResult> 
     throw new Error("OpenRouter response missing content");
   }
 
-  const parsed = JSON.parse(content);
+  const parsed = JSON.parse(content) as unknown;
   return inferenceSchema.parse(parsed);
 }
