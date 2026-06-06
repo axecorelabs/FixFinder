@@ -3,7 +3,7 @@ import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { PrismaClient } from "@prisma/client";
-import { Markup, Telegraf } from "telegraf";
+import { Markup, Telegraf, type Context } from "telegraf";
 import type { Update } from "telegraf/types";
 import { z } from "zod";
 import { inferIssue } from "@fixfinder/integrations";
@@ -323,22 +323,18 @@ customerBot.on("text", async (ctx) => {
     state.postalCode = text;
     intakeByUser.set(ctx.from.id, state);
     await ctx.reply(
-      "Thanks. Please share your phone contact so we can confirm the artisan assignment.",
+      "Thanks. Please share your phone number — tap the button or just type it.",
       Markup.keyboard([[Markup.button.contactRequest("Share contact")]]).oneTime().resize()
     );
     return;
   }
 
-  await ctx.reply("Use /new to start a fresh request.");
+  // Postal code already collected — treat typed text as phone number fallback.
+  await runIntakeAndDispatch(ctx, state, text);
 });
 
-customerBot.on("contact", async (ctx) => {
-  const state = intakeByUser.get(ctx.from.id);
-  if (!state?.issueText) {
-    await ctx.reply("Please start with /new and describe the issue first.");
-    return;
-  }
-
+async function runIntakeAndDispatch(ctx: Context, state: IntakeState, phone: string) {
+  if (!ctx.from) return;
   await ctx.reply("Analysing your issue...", Markup.removeKeyboard());
 
   let intake: Awaited<ReturnType<typeof createJobIntake>>;
@@ -347,10 +343,10 @@ customerBot.on("contact", async (ctx) => {
       customerTelegramId: String(ctx.from.id),
       customerName:
         [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || "Unknown",
-      customerPhone: ctx.message.contact.phone_number,
+      customerPhone: phone,
       locationText: "Location to be collected — next iteration",
       ...(state.postalCode ? { customerPostalCode: state.postalCode } : {}),
-      issueText: state.issueText,
+      issueText: state.issueText!,
       mediaUrls: state.mediaUrls
     });
   } catch (err) {
@@ -384,6 +380,15 @@ customerBot.on("contact", async (ctx) => {
   await ctx.reply(
     "✅ An artisan has been notified and will accept or decline shortly. We'll message you the moment they confirm."
   );
+}
+
+customerBot.on("contact", async (ctx) => {
+  const state = intakeByUser.get(ctx.from.id);
+  if (!state?.issueText) {
+    await ctx.reply("Please start with /new and describe the issue first.");
+    return;
+  }
+  await runIntakeAndDispatch(ctx, state, ctx.message.contact.phone_number);
 });
 
 // ── Artisan bot ───────────────────────────────────────────────────────────────
