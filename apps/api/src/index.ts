@@ -33,6 +33,15 @@ const BOT_MODE = process.env.BOT_MODE ?? "polling";
 const CUSTOMER_WEBHOOK_PATH = process.env.CUSTOMER_BOT_WEBHOOK_PATH ?? "/webhooks/customer";
 const ARTISAN_WEBHOOK_PATH = process.env.ARTISAN_BOT_WEBHOOK_PATH ?? "/webhooks/artisan";
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const TRADE_NAME: Record<string, string> = {
+  hvac: "HVAC Technician",
+  plumbing: "Plumber",
+  electrical: "Electrician",
+  general: "Handyman"
+};
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 type ArtisanRow = {
@@ -130,8 +139,19 @@ async function matchAndDispatch(jobId: string): Promise<{
 
   if (!job) return { found: false };
 
+  const previouslyDeclined = await prisma.jobOffer.findMany({
+    where: { jobId, offerStatus: "rejected" },
+    select: { artisanId: true }
+  });
+  const excludeIds = previouslyDeclined.map((o) => o.artisanId);
+
   const artisans = (await prisma.artisan.findMany({
-    where: { activeStatus: true, availableNow: true, skillType: job.aiCategory },
+    where: {
+      activeStatus: true,
+      availableNow: true,
+      skillType: job.aiCategory,
+      ...(excludeIds.length > 0 ? { id: { notIn: excludeIds } } : {})
+    },
     select: {
       id: true,
       telegramId: true,
@@ -210,7 +230,7 @@ async function respondToOffer(
   const offer = await prisma.jobOffer.findUnique({
     where: { id: offerId },
     include: {
-      job: { select: { id: true, customerTelegramId: true } },
+      job: { select: { id: true, customerTelegramId: true, aiCategory: true } },
       artisan: { select: { name: true, phone: true } }
     }
   });
@@ -253,6 +273,17 @@ async function respondToOffer(
         data: { status: "matching" }
       })
     ]);
+
+    // Immediately try the next best artisan, skipping anyone who already declined.
+    const tradeName = TRADE_NAME[offer.job.aiCategory] ?? "Artisan";
+    const retry = await matchAndDispatch(offer.jobId);
+    if (!retry.found) {
+      await telegramSend(CUSTOMER_TOKEN, "sendMessage", {
+        chat_id: offer.job.customerTelegramId,
+        text: `🔍 Still finding a *${tradeName}* for you — the first one was unavailable. We'll notify you as soon as someone accepts.`,
+        parse_mode: "Markdown"
+      });
+    }
   }
 
   return { ok: true };
@@ -364,8 +395,9 @@ async function runIntakeAndDispatch(ctx: Context, state: IntakeState, phone: str
   }
 
   intakeByUser.delete(ctx.from.id);
+  const tradeName = TRADE_NAME[intake.ai.category] ?? "Artisan";
   await ctx.reply(
-    `Job logged. Category: *${intake.ai.category.toUpperCase()}*\n_${intake.ai.summary}_\n\nFinding the best available artisan...`,
+    `Got it — *${intake.ai.summary}*\n\nFinding an *${tradeName}* for you, please hold on...`,
     { parse_mode: "Markdown" }
   );
 
@@ -828,6 +860,61 @@ app.post(ARTISAN_WEBHOOK_PATH, async (request, reply) => {
   return reply.status(200).send({ ok: true });
 });
 
+// ── Job timeout monitor ───────────────────────────────────────────────────────
+//
+// Runs every 2 minutes. For jobs stuck in "matching" or "offered" longer than
+// expected, sends the customer a timed status update.
+// Tier 1 (5 min):  "Still finding..."
+// Tier 2 (15 min): "Taking longer than usual..."
+// Tier 3 (30 min): "Couldn't find anyone right now" — job marked canceled.
+//
+// Note: notification state is in-memory. A server restart resets it, which means
+// tier messages may repeat once. Acceptable for a prototype.
+
+const notifiedTier1 = new Set<string>();
+const notifiedTier2 = new Set<string>();
+const notifiedTier3 = new Set<string>();
+
+async function runJobTimeoutMonitor() {
+  const now = new Date();
+  const stuckJobs = await prisma.job.findMany({
+    where: { status: { in: ["matching", "offered"] } },
+    select: { id: true, customerTelegramId: true, aiCategory: true, createdAt: true }
+  });
+
+  for (const job of stuckJobs) {
+    const ageMs = now.getTime() - job.createdAt.getTime();
+    const ageMins = ageMs / 60_000;
+    const tradeName = TRADE_NAME[job.aiCategory] ?? "Artisan";
+
+    if (ageMins >= 30 && !notifiedTier3.has(job.id)) {
+      notifiedTier3.add(job.id);
+      notifiedTier1.add(job.id);
+      notifiedTier2.add(job.id);
+      await prisma.job.update({ where: { id: job.id }, data: { status: "canceled" } });
+      await telegramSend(CUSTOMER_TOKEN, "sendMessage", {
+        chat_id: job.customerTelegramId,
+        text: `😔 We weren't able to find an available *${tradeName}* right now. We'll notify you as soon as one becomes available in your area.`,
+        parse_mode: "Markdown"
+      }).catch(() => undefined);
+    } else if (ageMins >= 15 && !notifiedTier2.has(job.id)) {
+      notifiedTier2.add(job.id);
+      await telegramSend(CUSTOMER_TOKEN, "sendMessage", {
+        chat_id: job.customerTelegramId,
+        text: `⏳ Still looking for a *${tradeName}* for you — this is taking a bit longer than usual. We're on it.`,
+        parse_mode: "Markdown"
+      }).catch(() => undefined);
+    } else if (ageMins >= 5 && !notifiedTier1.has(job.id)) {
+      notifiedTier1.add(job.id);
+      await telegramSend(CUSTOMER_TOKEN, "sendMessage", {
+        chat_id: job.customerTelegramId,
+        text: `🔍 Still finding a *${tradeName}* for you, hang tight...`,
+        parse_mode: "Markdown"
+      }).catch(() => undefined);
+    }
+  }
+}
+
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 async function autoSetupWebhooks() {
@@ -860,6 +947,12 @@ app
       await Promise.all([customerBot.launch(), artisanBot.launch()]);
       app.log.info("Both bots started in polling mode.");
     }
+
+    setInterval(() => {
+      runJobTimeoutMonitor().catch((err) =>
+        app.log.error({ err }, "Job timeout monitor error")
+      );
+    }, 2 * 60 * 1000);
   })
   .catch((err) => {
     app.log.error(err, "Failed to start server");
