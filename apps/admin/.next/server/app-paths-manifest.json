@@ -1,7 +1,8 @@
 {
-  "/jobs/page": "app/jobs/page.js",
-  "/webhooks/page": "app/webhooks/page.js",
   "/_not-found/page": "app/_not-found/page.js",
+  "/page": "app/page.js",
+  "/jobs/page": "app/jobs/page.js",
   "/artisans/page": "app/artisans/page.js",
-  "/page": "app/page.js"
+  "/webhooks/page": "app/webhooks/page.js",
+  "/signin/page": "app/signin/page.js"
 }

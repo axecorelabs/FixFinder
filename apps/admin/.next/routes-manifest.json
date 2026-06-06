@@ -33,10 +33,28 @@
       "namedRegex": "^/_not\\-found(?:/)?$"
     },
     {
+      "page": "/artisans",
+      "regex": "^/artisans(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/artisans(?:/)?$"
+    },
+    {
+      "page": "/jobs",
+      "regex": "^/jobs(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/jobs(?:/)?$"
+    },
+    {
       "page": "/signin",
       "regex": "^/signin(?:/)?$",
       "routeKeys": {},
       "namedRegex": "^/signin(?:/)?$"
+    },
+    {
+      "page": "/webhooks",
+      "regex": "^/webhooks(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/webhooks(?:/)?$"
     }
   ],
   "dataRoutes": [],
