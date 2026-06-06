@@ -1,1 +1,5 @@
-{"node":{"00d76014b1a41badf320dbd81ad10b87f978d64a33":{"workers":{"app/page":{"moduleId":"2393","async":false},"app/jobs/page":{"moduleId":"2393","async":false},"app/artisans/page":{"moduleId":"2393","async":false},"app/webhooks/page":{"moduleId":"2393","async":false}},"layer":{"app/page":"rsc","app/jobs/page":"rsc","app/artisans/page":"rsc","app/webhooks/page":"rsc"},"filename":"components/sign-out-button.tsx","exportedName":"$$RSC_SERVER_ACTION_0"},"4050ac8740d0db5ec440b9edcbe60684082cf23b11":{"workers":{"app/signin/page":{"moduleId":"3821","async":false}},"layer":{"app/signin/page":"rsc"},"filename":"app/signin/page.tsx","exportedName":"$$RSC_SERVER_ACTION_0"}},"edge":{},"encryptionKey":"25WY8SNeUQA1/+SmhMNvDxT7oNPXJQYbemvqtX+XNQ8="}
+{
+  "node": {},
+  "edge": {},
+  "encryptionKey": "25WY8SNeUQA1/+SmhMNvDxT7oNPXJQYbemvqtX+XNQ8="
+}

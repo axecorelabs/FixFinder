@@ -199,10 +199,9 @@ async function matchAndDispatch(jobId: string): Promise<{
       `*Category:* ${job.aiCategory.toUpperCase()}`,
       `*Issue:* ${job.aiSummary || job.issueText}`,
       `*Customer:* ${job.customerName}`,
-      `*Phone:* ${job.customerPhone}`,
       `*Location:* ${job.locationText}${job.customerPostalCode ? ` (${job.customerPostalCode})` : ""}`,
       ``,
-      `Reply to accept or decline this job.`
+      `Accept to receive the customer's phone number.`
     ].join("\n"),
     parse_mode: "Markdown",
     reply_markup: {
@@ -230,8 +229,8 @@ async function respondToOffer(
   const offer = await prisma.jobOffer.findUnique({
     where: { id: offerId },
     include: {
-      job: { select: { id: true, customerTelegramId: true, aiCategory: true } },
-      artisan: { select: { name: true, phone: true } }
+      job: { select: { id: true, customerTelegramId: true, aiCategory: true, customerName: true, customerPhone: true } },
+      artisan: { select: { telegramId: true, name: true, phone: true } }
     }
   });
 
@@ -250,18 +249,34 @@ async function respondToOffer(
       })
     ]);
 
-    await telegramSend(CUSTOMER_TOKEN, "sendMessage", {
-      chat_id: offer.job.customerTelegramId,
-      text: [
-        `✅ *Artisan Found!*`,
-        ``,
-        `*${offer.artisan.name}* has accepted your job request and will be in touch shortly.`,
-        `*Artisan phone:* ${offer.artisan.phone}`,
-        ``,
-        `We'll notify you when work begins. Thank you for using FixFinder!`
-      ].join("\n"),
-      parse_mode: "Markdown"
-    });
+    await Promise.all([
+      // Tell the customer an artisan is on the way.
+      telegramSend(CUSTOMER_TOKEN, "sendMessage", {
+        chat_id: offer.job.customerTelegramId,
+        text: [
+          `✅ *Artisan Found!*`,
+          ``,
+          `*${offer.artisan.name}* has accepted your job and will be in touch shortly.`,
+          `*Artisan phone:* ${offer.artisan.phone}`,
+          ``,
+          `Thank you for using FixFinder!`
+        ].join("\n"),
+        parse_mode: "Markdown"
+      }),
+      // Send the customer's contact details to the artisan now that they've accepted.
+      telegramSend(ARTISAN_TOKEN, "sendMessage", {
+        chat_id: offer.artisan.telegramId,
+        text: [
+          `📋 *Customer Contact Details*`,
+          ``,
+          `*Name:* ${offer.job.customerName}`,
+          `*Phone:* ${offer.job.customerPhone}`,
+          ``,
+          `Please reach out to them as soon as possible to confirm the visit.`
+        ].join("\n"),
+        parse_mode: "Markdown"
+      })
+    ]);
   } else {
     await Promise.all([
       prisma.jobOffer.update({
