@@ -3,9 +3,13 @@ import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { PrismaClient } from "@prisma/client";
+import { Markup, Telegraf } from "telegraf";
+import type { Update } from "telegraf/types";
 import { z } from "zod";
 import { inferIssue } from "@fixfinder/integrations";
 import { rankArtisans } from "@fixfinder/core";
+
+// ── App setup ────────────────────────────────────────────────────────────────
 
 const app = Fastify({ logger: true });
 const prisma = new PrismaClient();
@@ -15,14 +19,544 @@ void app.register(cors, {
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
 });
 
+// ── Config ───────────────────────────────────────────────────────────────────
+
+function requireEnv(name: string): string {
+  const val = process.env[name];
+  if (!val) throw new Error(`${name} is required`);
+  return val;
+}
+
+const CUSTOMER_TOKEN = requireEnv("TELEGRAM_CUSTOMER_BOT_TOKEN");
+const ARTISAN_TOKEN = requireEnv("TELEGRAM_ARTISAN_BOT_TOKEN");
+const BOT_MODE = process.env.BOT_MODE ?? "polling";
+const CUSTOMER_WEBHOOK_PATH = process.env.CUSTOMER_BOT_WEBHOOK_PATH ?? "/webhooks/customer";
+const ARTISAN_WEBHOOK_PATH = process.env.ARTISAN_BOT_WEBHOOK_PATH ?? "/webhooks/artisan";
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
 type ArtisanRow = {
   id: string;
   telegramId: string;
-  skillType: "hvac" | "plumbing" | "electrical" | "general";
+  skillType: string;
   ratingAvg: number;
   acceptanceRate: number;
   availableNow: boolean;
 };
+
+// ── Telegram API helper ───────────────────────────────────────────────────────
+
+async function telegramSend(
+  token: string,
+  method: string,
+  body?: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    ...(body ? { body: JSON.stringify(body) } : {})
+  });
+  if (!res.ok) throw new Error(`Telegram ${method} failed: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<Record<string, unknown>>;
+}
+
+// ── Business logic ────────────────────────────────────────────────────────────
+//
+// These functions are the single source of truth for all job/artisan operations.
+// Both the Telegram bot handlers and the REST routes below call them directly —
+// no internal HTTP round-trips.
+
+async function createJobIntake(input: {
+  customerTelegramId: string;
+  customerName: string;
+  customerPhone: string;
+  locationText: string;
+  issueText: string;
+  mediaUrls: string[];
+}) {
+  const ai = await inferIssue({ userText: input.issueText, imageUrls: input.mediaUrls });
+
+  const job = await prisma.job.create({
+    data: {
+      customerTelegramId: input.customerTelegramId,
+      customerName: input.customerName,
+      customerPhone: input.customerPhone,
+      locationText: input.locationText,
+      issueText: input.issueText,
+      aiCategory: ai.category,
+      aiSummary: ai.summary,
+      aiConfidence: ai.confidence,
+      status: "matching"
+    },
+    select: { id: true }
+  });
+
+  await prisma.aIInference.create({
+    data: {
+      jobId: job.id,
+      modelName: process.env.OPENROUTER_MODEL ?? "google/gemini-2.0-flash-001",
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      parsedJson: JSON.parse(JSON.stringify(ai)),
+      confidence: ai.confidence
+    }
+  });
+
+  return { jobId: job.id, ai, needsClarification: ai.confidence < 0.65 };
+}
+
+async function matchAndDispatch(jobId: string): Promise<{
+  found: boolean;
+  offerId?: string;
+  selectedArtisanTelegramId?: string;
+  score?: number;
+}> {
+  const job = await prisma.job.findUnique({
+    where: { id: jobId },
+    select: {
+      id: true,
+      customerTelegramId: true,
+      customerName: true,
+      customerPhone: true,
+      locationText: true,
+      issueText: true,
+      aiCategory: true,
+      aiSummary: true
+    }
+  });
+
+  if (!job) return { found: false };
+
+  const artisans = (await prisma.artisan.findMany({
+    where: { activeStatus: true, availableNow: true, skillType: job.aiCategory },
+    select: {
+      id: true,
+      telegramId: true,
+      skillType: true,
+      ratingAvg: true,
+      acceptanceRate: true,
+      availableNow: true
+    },
+    take: 25
+  })) as unknown as ArtisanRow[];
+
+  if (artisans.length === 0) return { found: false };
+
+  const candidates = artisans.map((a) => ({
+    artisanId: a.id,
+    skillMatch: 1,
+    distanceScore: 0.75,
+    availabilityScore: a.availableNow ? 1 : 0,
+    acceptanceRateScore: Number(a.acceptanceRate),
+    ratingScore: Math.min(Number(a.ratingAvg) / 5, 1)
+  }));
+
+  const ranked = rankArtisans(candidates);
+  const selected = ranked[0];
+  if (!selected) return { found: false };
+
+  const selectedArtisan = artisans.find((a) => a.id === selected.artisanId);
+  if (!selectedArtisan) return { found: false };
+
+  const offer = await prisma.jobOffer.create({
+    data: { jobId: job.id, artisanId: selected.artisanId, offerStatus: "pending" },
+    select: { id: true }
+  });
+
+  await prisma.job.update({ where: { id: job.id }, data: { status: "offered" } });
+
+  await telegramSend(ARTISAN_TOKEN, "sendMessage", {
+    chat_id: selectedArtisan.telegramId,
+    text: [
+      `🔧 *New Job Offer*`,
+      ``,
+      `*Category:* ${job.aiCategory.toUpperCase()}`,
+      `*Issue:* ${job.aiSummary || job.issueText}`,
+      `*Customer:* ${job.customerName}`,
+      `*Phone:* ${job.customerPhone}`,
+      `*Location:* ${job.locationText}`,
+      ``,
+      `Reply to accept or decline this job.`
+    ].join("\n"),
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "✅ Accept", callback_data: `offer:${offer.id}:accept` },
+          { text: "❌ Decline", callback_data: `offer:${offer.id}:decline` }
+        ]
+      ]
+    }
+  });
+
+  return {
+    found: true,
+    offerId: offer.id,
+    selectedArtisanTelegramId: selectedArtisan.telegramId,
+    score: selected.totalScore
+  };
+}
+
+async function respondToOffer(
+  offerId: string,
+  accepted: boolean
+): Promise<{ ok: boolean; alreadyResponded?: boolean }> {
+  const offer = await prisma.jobOffer.findUnique({
+    where: { id: offerId },
+    include: {
+      job: { select: { id: true, customerTelegramId: true } },
+      artisan: { select: { name: true, phone: true } }
+    }
+  });
+
+  if (!offer) return { ok: false };
+  if (offer.offerStatus !== "pending") return { ok: false, alreadyResponded: true };
+
+  if (accepted) {
+    await Promise.all([
+      prisma.jobOffer.update({
+        where: { id: offer.id },
+        data: { offerStatus: "accepted", respondedAt: new Date() }
+      }),
+      prisma.job.update({
+        where: { id: offer.jobId },
+        data: { status: "accepted" }
+      })
+    ]);
+
+    await telegramSend(CUSTOMER_TOKEN, "sendMessage", {
+      chat_id: offer.job.customerTelegramId,
+      text: [
+        `✅ *Artisan Found!*`,
+        ``,
+        `*${offer.artisan.name}* has accepted your job request and will be in touch shortly.`,
+        `*Artisan phone:* ${offer.artisan.phone}`,
+        ``,
+        `We'll notify you when work begins. Thank you for using FixFinder!`
+      ].join("\n"),
+      parse_mode: "Markdown"
+    });
+  } else {
+    await Promise.all([
+      prisma.jobOffer.update({
+        where: { id: offer.id },
+        data: { offerStatus: "rejected", respondedAt: new Date() }
+      }),
+      prisma.job.update({
+        where: { id: offer.jobId },
+        data: { status: "matching" }
+      })
+    ]);
+  }
+
+  return { ok: true };
+}
+
+// ── Customer bot ──────────────────────────────────────────────────────────────
+
+type IntakeState = {
+  issueText?: string;
+  mediaUrls: string[];
+  awaitingClarification?: boolean;
+};
+
+const intakeByUser = new Map<number, IntakeState>();
+const customerBot = new Telegraf(CUSTOMER_TOKEN);
+
+customerBot.start(async (ctx) => {
+  intakeByUser.set(ctx.from.id, { mediaUrls: [] });
+  await ctx.reply(
+    "Welcome to FixFinder! Describe your home issue — HVAC, plumbing, or electrical — and attach photos if you have them."
+  );
+});
+
+customerBot.command("new", async (ctx) => {
+  intakeByUser.set(ctx.from.id, { mediaUrls: [] });
+  await ctx.reply("Please describe your issue. You can send text and photos.");
+});
+
+customerBot.on("photo", async (ctx) => {
+  const state = intakeByUser.get(ctx.from.id) ?? { mediaUrls: [] };
+  const biggest = ctx.message.photo.at(-1);
+  if (!biggest) {
+    await ctx.reply("Could not process image. Please try again.");
+    return;
+  }
+  const fileLink = await ctx.telegram.getFileLink(biggest.file_id);
+  state.mediaUrls.push(fileLink.toString());
+  intakeByUser.set(ctx.from.id, state);
+  await ctx.reply("Image received. Now send a short description of the issue.");
+});
+
+customerBot.on("text", async (ctx) => {
+  const text = ctx.message.text.trim();
+  if (text.startsWith("/")) return;
+
+  const state = intakeByUser.get(ctx.from.id) ?? { mediaUrls: [] };
+
+  if (state.awaitingClarification && state.issueText) {
+    state.issueText = `${state.issueText}. Additional detail: ${text}`;
+    state.awaitingClarification = false;
+    intakeByUser.set(ctx.from.id, state);
+    await ctx.reply(
+      "Got it. Please share your phone contact so we can confirm the artisan assignment.",
+      Markup.keyboard([[Markup.button.contactRequest("Share contact")]]).oneTime().resize()
+    );
+    return;
+  }
+
+  if (!state.issueText) {
+    state.issueText = text;
+    intakeByUser.set(ctx.from.id, state);
+    await ctx.reply(
+      "Please share your phone contact so we can confirm the artisan assignment.",
+      Markup.keyboard([[Markup.button.contactRequest("Share contact")]]).oneTime().resize()
+    );
+    return;
+  }
+
+  await ctx.reply("Use /new to start a fresh request.");
+});
+
+customerBot.on("contact", async (ctx) => {
+  const state = intakeByUser.get(ctx.from.id);
+  if (!state?.issueText) {
+    await ctx.reply("Please start with /new and describe the issue first.");
+    return;
+  }
+
+  await ctx.reply("Analysing your issue...", Markup.removeKeyboard());
+
+  let intake: Awaited<ReturnType<typeof createJobIntake>>;
+  try {
+    intake = await createJobIntake({
+      customerTelegramId: String(ctx.from.id),
+      customerName:
+        [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || "Unknown",
+      customerPhone: ctx.message.contact.phone_number,
+      locationText: "Location to be collected — next iteration",
+      issueText: state.issueText,
+      mediaUrls: state.mediaUrls
+    });
+  } catch (err) {
+    app.log.error({ err }, "Intake failed");
+    await ctx.reply("Failed to create your request. Please try again shortly.");
+    return;
+  }
+
+  if (intake.needsClarification) {
+    intakeByUser.set(ctx.from.id, { ...state, awaitingClarification: true });
+    await ctx.reply(
+      `I have a rough idea of the issue (${intake.ai.category.toUpperCase()}) but could use a bit more detail.\n\nCan you describe what you see, hear, or smell?`
+    );
+    return;
+  }
+
+  intakeByUser.delete(ctx.from.id);
+  await ctx.reply(
+    `Job logged. Category: *${intake.ai.category.toUpperCase()}*\n_${intake.ai.summary}_\n\nFinding the best available artisan...`,
+    { parse_mode: "Markdown" }
+  );
+
+  const dispatch = await matchAndDispatch(intake.jobId);
+  if (!dispatch.found) {
+    await ctx.reply(
+      "No available artisans found right now. We'll notify you as soon as one becomes available."
+    );
+    return;
+  }
+
+  await ctx.reply(
+    "✅ An artisan has been notified and will accept or decline shortly. We'll message you the moment they confirm."
+  );
+});
+
+// ── Artisan bot ───────────────────────────────────────────────────────────────
+
+type RegistrationState = {
+  step: "name" | "phone" | "skill" | "area";
+  name?: string;
+  phone?: string;
+  skillType?: string;
+};
+
+const SKILL_CHOICES = ["hvac", "plumbing", "electrical", "general"];
+const registrationByUser = new Map<number, RegistrationState>();
+const artisanBot = new Telegraf(ARTISAN_TOKEN);
+
+artisanBot.start(async (ctx) => {
+  registrationByUser.delete(ctx.from.id);
+  await ctx.reply(
+    [
+      "👷 Welcome to FixFinder Artisan Bot.",
+      "",
+      "Use /register to sign up and start receiving job offers.",
+      "Use /ping to check bot status."
+    ].join("\n")
+  );
+});
+
+artisanBot.command("register", async (ctx) => {
+  registrationByUser.set(ctx.from.id, { step: "name" });
+  await ctx.reply("Let's get you registered. What is your full name?");
+});
+
+artisanBot.command("ping", async (ctx) => {
+  await ctx.reply("Artisan bot online.");
+});
+
+artisanBot.on("text", async (ctx) => {
+  const text = ctx.message.text.trim();
+  if (text.startsWith("/")) return;
+
+  const state = registrationByUser.get(ctx.from.id);
+  if (!state) {
+    await ctx.reply("Use /register to sign up, or /ping to check bot status.");
+    return;
+  }
+
+  if (state.step === "name") {
+    state.name = text;
+    state.step = "phone";
+    registrationByUser.set(ctx.from.id, state);
+    await ctx.reply(
+      "What is your phone number?",
+      Markup.keyboard([[Markup.button.contactRequest("Share contact")]]).oneTime().resize()
+    );
+    return;
+  }
+
+  if (state.step === "phone") {
+    state.phone = text;
+    state.step = "skill";
+    registrationByUser.set(ctx.from.id, state);
+    await ctx.reply(
+      "What is your primary skill?",
+      Markup.keyboard([SKILL_CHOICES.map((s) => s.toUpperCase())]).oneTime().resize()
+    );
+    return;
+  }
+
+  if (state.step === "skill") {
+    const normalised = text.toLowerCase();
+    if (!SKILL_CHOICES.includes(normalised)) {
+      await ctx.reply(
+        `Please choose one of: ${SKILL_CHOICES.join(", ")}`,
+        Markup.keyboard([SKILL_CHOICES.map((s) => s.toUpperCase())]).oneTime().resize()
+      );
+      return;
+    }
+    state.skillType = normalised;
+    state.step = "area";
+    registrationByUser.set(ctx.from.id, state);
+    await ctx.reply(
+      "What area or neighbourhood do you serve? (e.g. Lagos Island, Lekki Phase 1)",
+      Markup.removeKeyboard()
+    );
+    return;
+  }
+
+  if (state.step === "area") {
+    registrationByUser.delete(ctx.from.id);
+    try {
+      await prisma.artisan.create({
+        data: {
+          telegramId: String(ctx.from.id),
+          name: state.name!,
+          phone: state.phone!,
+          skillType: state.skillType!,
+          serviceArea: text,
+          ratingAvg: 4,
+          acceptanceRate: 0.8,
+          availableNow: true,
+          activeStatus: true
+        }
+      });
+    } catch {
+      await ctx.reply(
+        "Registration failed. You may already be registered. Try /register again."
+      );
+      return;
+    }
+
+    await ctx.reply(
+      [
+        `✅ *Registration complete!*`,
+        ``,
+        `*Name:* ${state.name}`,
+        `*Skill:* ${state.skillType?.toUpperCase()}`,
+        `*Service area:* ${text}`,
+        ``,
+        `You will receive job offers here. Accept or decline using the buttons provided.`
+      ].join("\n"),
+      { parse_mode: "Markdown" }
+    );
+  }
+});
+
+artisanBot.on("contact", async (ctx) => {
+  const state = registrationByUser.get(ctx.from.id);
+  if (!state || state.step !== "phone") {
+    await ctx.reply("Use /register to start the registration process.");
+    return;
+  }
+
+  state.phone = ctx.message.contact.phone_number;
+  state.step = "skill";
+  registrationByUser.set(ctx.from.id, state);
+  await ctx.reply(
+    "What is your primary skill?",
+    Markup.keyboard([SKILL_CHOICES.map((s) => s.toUpperCase())]).oneTime().resize()
+  );
+});
+
+artisanBot.on("callback_query", async (ctx) => {
+  const data = (ctx.callbackQuery as { data?: string }).data;
+  if (!data?.startsWith("offer:")) {
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const parts = data.split(":");
+  const offerId = parts[1];
+  const action = parts[2];
+
+  if (!offerId || (action !== "accept" && action !== "decline")) {
+    await ctx.answerCbQuery("Invalid action.");
+    return;
+  }
+
+  const result = await respondToOffer(offerId, action === "accept");
+
+  if (!result.ok) {
+    await ctx.answerCbQuery(
+      result.alreadyResponded
+        ? "This offer has already been responded to."
+        : "Offer not found."
+    );
+    return;
+  }
+
+  if (action === "accept") {
+    await ctx.answerCbQuery("Job accepted! The customer has been notified.");
+    await ctx.editMessageText(
+      [
+        `✅ *Job Accepted*`,
+        ``,
+        `The customer has been notified and will be expecting your call.`,
+        `Please reach out as soon as possible.`
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: { inline_keyboard: [] } }
+    );
+  } else {
+    await ctx.answerCbQuery("Job declined.");
+    await ctx.editMessageText(
+      `❌ *Job Declined*\n\nThe job has been returned to the dispatch queue.`,
+      { parse_mode: "Markdown", reply_markup: { inline_keyboard: [] } }
+    );
+  }
+});
+
+// ── Validation schemas (used by REST routes) ──────────────────────────────────
 
 const intakeSchema = z.object({
   customerTelegramId: z.string().min(1),
@@ -50,92 +584,32 @@ const webhookConnectSchema = z.object({
   dropPendingUpdates: z.boolean().default(false)
 });
 
-type WebhookInfo = {
-  ok?: boolean;
-  result?: {
-    url?: string;
-    has_custom_certificate?: boolean;
-    pending_update_count?: number;
-    max_connections?: number;
-    ip_address?: string;
-    last_error_date?: number;
-    last_error_message?: string;
-    last_synchronization_error_date?: number;
-  };
-  description?: string;
-};
+// ── REST routes ───────────────────────────────────────────────────────────────
 
-async function telegramApiCall(token: string, method: string, body?: Record<string, unknown>) {
-  const requestInit: RequestInit = {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    }
-  };
+app.get("/health", async () => ({
+  ok: true,
+  service: "fixfinder-api",
+  botMode: BOT_MODE
+}));
 
-  if (body) {
-    requestInit.body = JSON.stringify(body);
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    ...requestInit
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram API ${method} failed: ${response.status} ${response.statusText}`);
-  }
-
-  return (await response.json()) as WebhookInfo;
-}
-
-app.get("/health", async () => ({ ok: true, service: "fixfinder-api" }));
-
+// Kept for external/admin use; bots call the underlying functions directly.
 app.post("/jobs/intake", async (request, reply) => {
   const input = intakeSchema.parse(request.body);
-
-  const ai = await inferIssue({ userText: input.issueText, imageUrls: input.mediaUrls });
-
-  let job: { id: string };
   try {
-    job = await prisma.job.create({
-      data: {
-        customerTelegramId: input.customerTelegramId,
-        customerName: input.customerName,
-        customerPhone: input.customerPhone,
-        locationText: input.locationText,
-        issueText: input.issueText,
-        aiCategory: ai.category,
-        aiSummary: ai.summary,
-        aiConfidence: ai.confidence,
-        status: "matching"
-      },
-      select: { id: true }
-    });
-  } catch (error) {
-    request.log.error({ err: error }, "Failed to insert job");
-    return reply.status(500).send({ error: "Failed to create job" });
+    const result = await createJobIntake(input);
+    return {
+      jobId: result.jobId,
+      ai: result.ai,
+      next: result.needsClarification ? "ask_clarifying_question" : "start_matching"
+    };
+  } catch (err) {
+    request.log.error({ err }, "Intake failed");
+    return reply.status(500).send({ error: "Intake failed" });
   }
-
-  await prisma.aIInference.create({
-    data: {
-      jobId: job.id,
-      modelName: process.env.OPENROUTER_MODEL ?? "google/gemini-2.0-flash-001",
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-      parsedJson: JSON.parse(JSON.stringify(ai)),
-      confidence: ai.confidence
-    }
-  });
-
-  return {
-    jobId: job.id,
-    ai,
-    next: ai.confidence < 0.65 ? "ask_clarifying_question" : "start_matching"
-  };
 });
 
 app.post("/artisans/register", async (request, reply) => {
   const input = artisanRegistrationSchema.parse(request.body);
-
   try {
     await prisma.artisan.create({
       data: {
@@ -150,207 +624,45 @@ app.post("/artisans/register", async (request, reply) => {
         activeStatus: true
       }
     });
-  } catch (error) {
-    request.log.error({ err: error }, "Failed to register artisan");
-    return reply.status(500).send({ error: "Failed to register artisan" });
+  } catch (err) {
+    request.log.error({ err }, "Artisan registration failed");
+    return reply.status(500).send({ error: "Registration failed" });
   }
-
   return { ok: true };
 });
 
 app.post("/dispatch/match/:jobId", async (request, reply) => {
-  const params = z.object({ jobId: z.string().uuid() }).parse(request.params);
-
-  const job = await prisma.job.findUnique({
-    where: { id: params.jobId },
-    select: {
-      id: true,
-      customerTelegramId: true,
-      customerName: true,
-      customerPhone: true,
-      locationText: true,
-      issueText: true,
-      aiCategory: true,
-      aiSummary: true
-    }
-  });
-
-  if (!job) {
-    return reply.status(404).send({ error: "Job not found" });
-  }
-
-  const artisans = (await prisma.artisan.findMany({
-    where: {
-      activeStatus: true,
-      availableNow: true,
-      skillType: job.aiCategory
-    },
-    select: {
-      id: true,
-      telegramId: true,
-      skillType: true,
-      ratingAvg: true,
-      acceptanceRate: true,
-      availableNow: true
-    },
-    take: 25
-  })) as unknown as ArtisanRow[];
-
-  const candidates = artisans.map((artisan) => ({
-    artisanId: artisan.id,
-    skillMatch: 1,
-    distanceScore: 0.75,
-    availabilityScore: artisan.availableNow ? 1 : 0,
-    acceptanceRateScore: Number(artisan.acceptanceRate),
-    ratingScore: Math.min(Number(artisan.ratingAvg) / 5, 1)
-  }));
-
-  const ranked = rankArtisans(candidates);
-  const selected = ranked[0];
-
-  if (!selected) {
+  const { jobId } = z.object({ jobId: z.string().uuid() }).parse(request.params);
+  const result = await matchAndDispatch(jobId);
+  if (!result.found) {
     return reply.status(404).send({ error: "No available artisans" });
   }
-
-  const selectedArtisan = artisans.find((a) => a.id === selected.artisanId);
-  if (!selectedArtisan) {
-    return reply.status(500).send({ error: "Selected artisan not found" });
-  }
-
-  const offer = await prisma.jobOffer.create({
-    data: {
-      jobId: job.id,
-      artisanId: selected.artisanId,
-      offerStatus: "pending"
-    },
-    select: { id: true }
-  });
-
-  await prisma.job.update({ where: { id: job.id }, data: { status: "offered" } });
-
-  const artisanToken = process.env.TELEGRAM_ARTISAN_BOT_TOKEN;
-  if (artisanToken) {
-    const categoryLabel = job.aiCategory.toUpperCase();
-    const description = job.aiSummary || job.issueText;
-    const message = [
-      `🔧 *New Job Offer*`,
-      ``,
-      `*Category:* ${categoryLabel}`,
-      `*Issue:* ${description}`,
-      `*Customer:* ${job.customerName}`,
-      `*Phone:* ${job.customerPhone}`,
-      `*Location:* ${job.locationText}`,
-      ``,
-      `Reply to accept or decline this job.`
-    ].join("\n");
-
-    await telegramApiCall(artisanToken, "sendMessage", {
-      chat_id: selectedArtisan.telegramId,
-      text: message,
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "✅ Accept", callback_data: `offer:${offer.id}:accept` },
-            { text: "❌ Decline", callback_data: `offer:${offer.id}:decline` }
-          ]
-        ]
-      }
-    });
-  }
-
-  return {
-    jobId: job.id,
-    offerId: offer.id,
-    selectedArtisanTelegramId: selectedArtisan.telegramId,
-    score: selected.totalScore
-  };
+  return result;
 });
 
 app.post("/jobs/offers/:offerId/respond", async (request, reply) => {
-  const params = z.object({ offerId: z.string().uuid() }).parse(request.params);
-  const body = z.object({ accepted: z.boolean() }).parse(request.body);
-
-  const offer = await prisma.jobOffer.findUnique({
-    where: { id: params.offerId },
-    include: {
-      job: {
-        select: {
-          id: true,
-          customerTelegramId: true,
-          customerName: true,
-          aiCategory: true,
-          aiSummary: true,
-          issueText: true
-        }
-      },
-      artisan: {
-        select: { name: true, phone: true }
-      }
-    }
-  });
-
-  if (!offer) {
-    return reply.status(404).send({ error: "Offer not found" });
+  const { offerId } = z.object({ offerId: z.string().uuid() }).parse(request.params);
+  const { accepted } = z.object({ accepted: z.boolean() }).parse(request.body);
+  const result = await respondToOffer(offerId, accepted);
+  if (!result.ok) {
+    const status = result.alreadyResponded ? 409 : 404;
+    return reply.status(status).send({ error: result.alreadyResponded ? "Already responded" : "Offer not found" });
   }
-
-  if (offer.offerStatus !== "pending") {
-    return reply.status(409).send({ error: "Offer already responded to" });
-  }
-
-  if (body.accepted) {
-    await Promise.all([
-      prisma.jobOffer.update({
-        where: { id: offer.id },
-        data: { offerStatus: "accepted", respondedAt: new Date() }
-      }),
-      prisma.job.update({
-        where: { id: offer.jobId },
-        data: { status: "accepted" }
-      })
-    ]);
-
-    const customerToken = process.env.TELEGRAM_CUSTOMER_BOT_TOKEN;
-    if (customerToken) {
-      const message = [
-        `✅ *Artisan Found!*`,
-        ``,
-        `*${offer.artisan.name}* has accepted your job request and will be in touch shortly.`,
-        `*Artisan phone:* ${offer.artisan.phone}`,
-        ``,
-        `We'll notify you when work begins. Thank you for using FixFinder!`
-      ].join("\n");
-
-      await telegramApiCall(customerToken, "sendMessage", {
-        chat_id: offer.job.customerTelegramId,
-        text: message,
-        parse_mode: "Markdown"
-      });
-    }
-  } else {
-    await Promise.all([
-      prisma.jobOffer.update({
-        where: { id: offer.id },
-        data: { offerStatus: "rejected", respondedAt: new Date() }
-      }),
-      prisma.job.update({
-        where: { id: offer.jobId },
-        data: { status: "matching" }
-      })
-    ]);
-  }
-
-  return { ok: true, accepted: body.accepted };
+  return { ok: true, accepted };
 });
 
-// ── Admin data endpoints ────────────────────────────────────────────────────
+// ── Admin data routes ─────────────────────────────────────────────────────────
 
 app.get("/admin/stats", async () => {
   const [totalJobs, activeJobs, completedJobs, totalArtisans, availableArtisans, pendingOffers] =
     await Promise.all([
       prisma.job.count(),
       prisma.job.count({
-        where: { status: { in: ["created", "collecting_details", "matching", "offered", "accepted", "in_progress"] } }
+        where: {
+          status: {
+            in: ["created", "collecting_details", "matching", "offered", "accepted", "in_progress"]
+          }
+        }
       }),
       prisma.job.count({ where: { status: "completed" } }),
       prisma.artisan.count(),
@@ -362,7 +674,7 @@ app.get("/admin/stats", async () => {
 });
 
 app.get("/admin/jobs", async (request) => {
-  const query = z
+  const { limit, offset } = z
     .object({
       limit: z.coerce.number().min(1).max(100).default(20),
       offset: z.coerce.number().min(0).default(0)
@@ -381,8 +693,8 @@ app.get("/admin/jobs", async (request) => {
         createdAt: true
       },
       orderBy: { createdAt: "desc" },
-      take: query.limit,
-      skip: query.offset
+      take: limit,
+      skip: offset
     }),
     prisma.job.count()
   ]);
@@ -405,158 +717,126 @@ app.get("/admin/artisans", async () => {
     },
     orderBy: { createdAt: "desc" }
   });
-
   return { artisans };
 });
 
-// ── Webhook management ──────────────────────────────────────────────────────
+// ── Webhook management routes ─────────────────────────────────────────────────
 
-app.get("/admin/webhooks/status", async (request, reply) => {
-  const customerToken = process.env.TELEGRAM_CUSTOMER_BOT_TOKEN;
-  const artisanToken = process.env.TELEGRAM_ARTISAN_BOT_TOKEN;
-
-  if (!customerToken || !artisanToken) {
-    return reply.status(400).send({
-      error: "Bot tokens are missing. Set TELEGRAM_CUSTOMER_BOT_TOKEN and TELEGRAM_ARTISAN_BOT_TOKEN."
-    });
+app.get("/admin/webhooks/status", async (_, reply) => {
+  if (!CUSTOMER_TOKEN || !ARTISAN_TOKEN) {
+    return reply.status(400).send({ error: "Bot tokens missing." });
   }
-
-  const [customerInfo, artisanInfo] = await Promise.all([
-    telegramApiCall(customerToken, "getWebhookInfo"),
-    telegramApiCall(artisanToken, "getWebhookInfo")
+  const [customer, artisan] = await Promise.all([
+    telegramSend(CUSTOMER_TOKEN, "getWebhookInfo"),
+    telegramSend(ARTISAN_TOKEN, "getWebhookInfo")
   ]);
-
   return {
-    customer: customerInfo.result,
-    artisan: artisanInfo.result
+    customer: (customer as { result?: unknown }).result,
+    artisan: (artisan as { result?: unknown }).result
   };
 });
 
 app.post("/admin/webhooks/connect", async (request, reply) => {
   const input = webhookConnectSchema.parse(request.body);
-  const customerToken = process.env.TELEGRAM_CUSTOMER_BOT_TOKEN;
-  const artisanToken = process.env.TELEGRAM_ARTISAN_BOT_TOKEN;
-
-  if (!customerToken || !artisanToken) {
-    return reply.status(400).send({
-      error: "Bot tokens are missing. Set TELEGRAM_CUSTOMER_BOT_TOKEN and TELEGRAM_ARTISAN_BOT_TOKEN."
-    });
+  if (!CUSTOMER_TOKEN || !ARTISAN_TOKEN) {
+    return reply.status(400).send({ error: "Bot tokens missing." });
   }
-
   const [customerResult, artisanResult] = await Promise.all([
-    telegramApiCall(customerToken, "setWebhook", {
+    telegramSend(CUSTOMER_TOKEN, "setWebhook", {
       url: input.customerWebhookUrl,
       drop_pending_updates: input.dropPendingUpdates
     }),
-    telegramApiCall(artisanToken, "setWebhook", {
+    telegramSend(ARTISAN_TOKEN, "setWebhook", {
       url: input.artisanWebhookUrl,
       drop_pending_updates: input.dropPendingUpdates
     })
   ]);
-
-  return {
-    ok: true,
-    customer: customerResult,
-    artisan: artisanResult
-  };
+  return { ok: true, customer: customerResult, artisan: artisanResult };
 });
 
-app.post("/admin/webhooks/disconnect", async (request, reply) => {
-  const customerToken = process.env.TELEGRAM_CUSTOMER_BOT_TOKEN;
-  const artisanToken = process.env.TELEGRAM_ARTISAN_BOT_TOKEN;
-
-  if (!customerToken || !artisanToken) {
-    return reply.status(400).send({
-      error: "Bot tokens are missing. Set TELEGRAM_CUSTOMER_BOT_TOKEN and TELEGRAM_ARTISAN_BOT_TOKEN."
-    });
+app.post("/admin/webhooks/disconnect", async (_, reply) => {
+  if (!CUSTOMER_TOKEN || !ARTISAN_TOKEN) {
+    return reply.status(400).send({ error: "Bot tokens missing." });
   }
-
   const [customerResult, artisanResult] = await Promise.all([
-    telegramApiCall(customerToken, "deleteWebhook", { drop_pending_updates: true }),
-    telegramApiCall(artisanToken, "deleteWebhook", { drop_pending_updates: true })
+    telegramSend(CUSTOMER_TOKEN, "deleteWebhook", { drop_pending_updates: true }),
+    telegramSend(ARTISAN_TOKEN, "deleteWebhook", { drop_pending_updates: true })
   ]);
-
-  return {
-    ok: true,
-    customer: customerResult,
-    artisan: artisanResult
-  };
+  return { ok: true, customer: customerResult, artisan: artisanResult };
 });
 
-app.post("/admin/webhooks/auto-setup", async (request, reply) => {
-  const customerToken = process.env.TELEGRAM_CUSTOMER_BOT_TOKEN;
-  const artisanToken = process.env.TELEGRAM_ARTISAN_BOT_TOKEN;
+app.post("/admin/webhooks/auto-setup", async (_, reply) => {
   const publicBaseUrl = process.env.PUBLIC_BASE_URL;
-
-  if (!customerToken || !artisanToken) {
-    return reply.status(400).send({
-      error: "Bot tokens are missing. Set TELEGRAM_CUSTOMER_BOT_TOKEN and TELEGRAM_ARTISAN_BOT_TOKEN."
-    });
-  }
-
   if (!publicBaseUrl) {
     return reply.status(400).send({
       error: "PUBLIC_BASE_URL is not set. Add it to your .env to enable auto-setup."
     });
   }
-
-  const customerWebhookUrl = `${publicBaseUrl}${process.env.CUSTOMER_BOT_WEBHOOK_PATH ?? "/webhooks/customer"}`;
-  const artisanWebhookUrl = `${publicBaseUrl}${process.env.ARTISAN_BOT_WEBHOOK_PATH ?? "/webhooks/artisan"}`;
-
+  const customerWebhookUrl = `${publicBaseUrl}${CUSTOMER_WEBHOOK_PATH}`;
+  const artisanWebhookUrl = `${publicBaseUrl}${ARTISAN_WEBHOOK_PATH}`;
   const [customerResult, artisanResult] = await Promise.all([
-    telegramApiCall(customerToken, "setWebhook", { url: customerWebhookUrl, drop_pending_updates: false }),
-    telegramApiCall(artisanToken, "setWebhook", { url: artisanWebhookUrl, drop_pending_updates: false })
+    telegramSend(CUSTOMER_TOKEN, "setWebhook", { url: customerWebhookUrl }),
+    telegramSend(ARTISAN_TOKEN, "setWebhook", { url: artisanWebhookUrl })
   ]);
-
-  return {
-    ok: true,
-    customerWebhookUrl,
-    artisanWebhookUrl,
-    customer: customerResult,
-    artisan: artisanResult
-  };
+  return { ok: true, customerWebhookUrl, artisanWebhookUrl, customer: customerResult, artisan: artisanResult };
 });
 
-// ── Startup webhook auto-setup ──────────────────────────────────────────────
+// ── Telegram webhook receiver routes ──────────────────────────────────────────
 
-async function autoSetupWebhooksOnStart() {
-  const publicBaseUrl = process.env.PUBLIC_BASE_URL;
-  if (!publicBaseUrl) return;
+app.post(CUSTOMER_WEBHOOK_PATH, async (request, reply) => {
+  await customerBot.handleUpdate(request.body as Update);
+  return reply.status(200).send({ ok: true });
+});
 
-  const customerToken = process.env.TELEGRAM_CUSTOMER_BOT_TOKEN;
-  const artisanToken = process.env.TELEGRAM_ARTISAN_BOT_TOKEN;
+app.post(ARTISAN_WEBHOOK_PATH, async (request, reply) => {
+  await artisanBot.handleUpdate(request.body as Update);
+  return reply.status(200).send({ ok: true });
+});
 
-  if (!customerToken || !artisanToken) {
-    app.log.warn("PUBLIC_BASE_URL is set but bot tokens are missing — skipping webhook auto-setup.");
-    return;
-  }
+// ── Startup ───────────────────────────────────────────────────────────────────
 
-  const customerWebhookUrl = `${publicBaseUrl}${process.env.CUSTOMER_BOT_WEBHOOK_PATH ?? "/webhooks/customer"}`;
-  const artisanWebhookUrl = `${publicBaseUrl}${process.env.ARTISAN_BOT_WEBHOOK_PATH ?? "/webhooks/artisan"}`;
-
+async function autoSetupWebhooks() {
+  const baseUrl = process.env.PUBLIC_BASE_URL;
+  if (!baseUrl) return;
   try {
     await Promise.all([
-      telegramApiCall(customerToken, "setWebhook", { url: customerWebhookUrl }),
-      telegramApiCall(artisanToken, "setWebhook", { url: artisanWebhookUrl })
+      telegramSend(CUSTOMER_TOKEN, "setWebhook", { url: `${baseUrl}${CUSTOMER_WEBHOOK_PATH}` }),
+      telegramSend(ARTISAN_TOKEN, "setWebhook", { url: `${baseUrl}${ARTISAN_WEBHOOK_PATH}` })
     ]);
-    app.log.info({ customerWebhookUrl, artisanWebhookUrl }, "Telegram webhooks auto-configured.");
+    app.log.info(
+      { customer: `${baseUrl}${CUSTOMER_WEBHOOK_PATH}`, artisan: `${baseUrl}${ARTISAN_WEBHOOK_PATH}` },
+      "Telegram webhooks auto-configured."
+    );
   } catch (err) {
-    app.log.error({ err }, "Webhook auto-setup failed — check PUBLIC_BASE_URL and bot tokens.");
+    app.log.error({ err }, "Webhook auto-setup failed.");
   }
 }
 
-const API_PORT = Number(process.env.API_PORT ?? 4000);
+const PORT = Number(process.env.PORT ?? process.env.API_PORT ?? 4000);
 
 app
-  .listen({ port: API_PORT, host: "0.0.0.0" })
+  .listen({ port: PORT, host: "0.0.0.0" })
   .then(async () => {
-    app.log.info(`FixFinder API running on port ${API_PORT}`);
-    await autoSetupWebhooksOnStart();
+    app.log.info(`FixFinder running on port ${PORT} — bots in ${BOT_MODE} mode`);
+
+    if (BOT_MODE === "webhook") {
+      await autoSetupWebhooks();
+    } else {
+      await Promise.all([customerBot.launch(), artisanBot.launch()]);
+      app.log.info("Both bots started in polling mode.");
+    }
   })
-  .catch((error) => {
-    app.log.error(error, "Failed to start API");
+  .catch((err) => {
+    app.log.error(err, "Failed to start server");
     process.exit(1);
   });
+
+process.once("SIGINT", () => {
+  void Promise.all([customerBot.stop("SIGINT"), artisanBot.stop("SIGINT")]);
+});
+process.once("SIGTERM", () => {
+  void Promise.all([customerBot.stop("SIGTERM"), artisanBot.stop("SIGTERM")]);
+});
 
 process.on("beforeExit", async () => {
   await prisma.$disconnect();

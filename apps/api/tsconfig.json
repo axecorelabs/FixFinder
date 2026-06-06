@@ -1,11 +1,8 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "baseUrl": ".",
-    "paths": {
-      "@fixfinder/core": ["../../packages/core/src/index.ts"],
-      "@fixfinder/integrations": ["../../packages/integrations/src/index.ts"]
-    }
+    "rootDir": "src",
+    "outDir": "dist"
   },
   "include": ["src/**/*.ts"]
 }

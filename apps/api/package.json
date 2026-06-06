@@ -6,8 +6,9 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
+    "dev": "npm run build:packages && tsx watch src/index.ts",
+    "build": "npm run build:packages && tsc -p tsconfig.json",
+    "build:packages": "npm run build -w @fixfinder/core && npm run build -w @fixfinder/integrations",
     "start": "node dist/index.js",
     "prisma:generate": "prisma generate --schema prisma/schema.prisma",
     "prisma:migrate": "prisma migrate dev --schema prisma/schema.prisma",
@@ -22,6 +23,7 @@
     "@fixfinder/integrations": "0.1.0",
     "dotenv": "^16.4.7",
     "fastify": "^5.2.1",
+    "telegraf": "^4.16.3",
     "zod": "^3.24.1"
   },
   "devDependencies": {
