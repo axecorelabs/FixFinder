@@ -87,6 +87,16 @@ async function createJobIntake(input: {
 }) {
   const ai = await inferIssue({ userText: input.issueText, imageUrls: input.mediaUrls });
 
+  // Cancel any previous pending jobs from this customer before creating a new one.
+  // This prevents orphaned "matching" jobs from the clarification retry flow.
+  await prisma.job.updateMany({
+    where: {
+      customerTelegramId: input.customerTelegramId,
+      status: { in: ["matching", "offered"] }
+    },
+    data: { status: "canceled" }
+  });
+
   const job = await prisma.job.create({
     data: {
       customerTelegramId: input.customerTelegramId,
@@ -894,13 +904,14 @@ async function runJobTimeoutMonitor() {
   const now = new Date();
   const stuckJobs = await prisma.job.findMany({
     where: { status: { in: ["matching", "offered"] } },
-    select: { id: true, customerTelegramId: true, aiCategory: true, createdAt: true }
+    select: { id: true, customerTelegramId: true, aiCategory: true, status: true, createdAt: true }
   });
 
   for (const job of stuckJobs) {
     const ageMs = now.getTime() - job.createdAt.getTime();
     const ageMins = ageMs / 60_000;
     const tradeName = TRADE_NAME[job.aiCategory] ?? "Artisan";
+    const isOffered = job.status === "offered";
 
     if (ageMins >= 30 && !notifiedTier3.has(job.id)) {
       notifiedTier3.add(job.id);
@@ -914,16 +925,22 @@ async function runJobTimeoutMonitor() {
       }).catch(() => undefined);
     } else if (ageMins >= 15 && !notifiedTier2.has(job.id)) {
       notifiedTier2.add(job.id);
+      const text = isOffered
+        ? `⏳ A *${tradeName}* has been notified but hasn't responded yet — still waiting on their reply.`
+        : `⏳ Still searching for a *${tradeName}* for you — this is taking a bit longer than usual. We're on it.`;
       await telegramSend(CUSTOMER_TOKEN, "sendMessage", {
         chat_id: job.customerTelegramId,
-        text: `⏳ Still looking for a *${tradeName}* for you — this is taking a bit longer than usual. We're on it.`,
+        text,
         parse_mode: "Markdown"
       }).catch(() => undefined);
     } else if (ageMins >= 5 && !notifiedTier1.has(job.id)) {
       notifiedTier1.add(job.id);
+      const text = isOffered
+        ? `⏳ A *${tradeName}* has been notified and is reviewing your request...`
+        : `🔍 Still finding a *${tradeName}* for you, hang tight...`;
       await telegramSend(CUSTOMER_TOKEN, "sendMessage", {
         chat_id: job.customerTelegramId,
-        text: `🔍 Still finding a *${tradeName}* for you, hang tight...`,
+        text,
         parse_mode: "Markdown"
       }).catch(() => undefined);
     }
